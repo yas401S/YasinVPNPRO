@@ -3,6 +3,8 @@ package com.yasinvpn.pro
 import android.content.Intent
 import android.net.VpnService
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -27,17 +29,62 @@ private val Gold = Color(0xFFE0B85C)
 class MainActivity : ComponentActivity() {
     private lateinit var backend: Backend
     private val worker = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val connected = mutableStateOf(false)
     private val hasConfig = mutableStateOf(false)
     private val busy = mutableStateOf(false)
     private val status = mutableStateOf("آماده اتصال")
+    private val traffic = mutableStateOf("هنوز آماری دریافت نشده")
     private var config: Config? = null
     private val preferences by lazy { getSharedPreferences("yasin_vpn", MODE_PRIVATE) }
+
+    private val statsMonitor = object : Runnable {
+        override fun run() {
+            if (!connected.value || isFinishing || isDestroyed) return
+            worker.execute {
+                try {
+                    val stats = backend.getStatistics(tunnel)
+                    val handshakes = stats.peers().mapNotNull { key ->
+                        stats.peer(key)?.latestHandshakeEpochMillis()
+                    }.filter { it > 0L }
+                    val rx = stats.totalRx()
+                    val tx = stats.totalTx()
+                    runOnUiThread {
+                        if (!connected.value) return@runOnUiThread
+                        traffic.value = "دریافت: ${formatBytes(rx)}  |  ارسال: ${formatBytes(tx)}"
+                        status.value = when {
+                            handshakes.isEmpty() ->
+                                "تونل روشن است، اما هنوز پاسخی از سرور نگرفته‌ایم"
+                            rx == 0L ->
+                                "پاسخ سرور دریافت شده؛ هنوز داده‌ای وارد تونل نشده"
+                            else ->
+                                "ارتباط WireGuard با سرور برقرار است"
+                        }
+                    }
+                } catch (e: Exception) {
+                    runOnUiThread {
+                        if (connected.value) status.value = "خطا در بررسی ارتباط سرور"
+                    }
+                }
+            }
+            mainHandler.postDelayed(this, 3000L)
+        }
+    }
+
     private val tunnel = AppTunnel { state ->
         runOnUiThread {
             connected.value = state == Tunnel.State.UP
             busy.value = false
-            status.value = if (connected.value) "تونل WireGuard فعال است" else "اتصال برقرار نیست"
+            if (connected.value) {
+                status.value = "تونل فعال شد؛ در حال بررسی پاسخ سرور..."
+                traffic.value = "در حال خواندن آمار ارتباط..."
+                mainHandler.removeCallbacks(statsMonitor)
+                mainHandler.post(statsMonitor)
+            } else {
+                mainHandler.removeCallbacks(statsMonitor)
+                status.value = "اتصال برقرار نیست"
+                traffic.value = "تونل قطع است"
+            }
         }
     }
 
@@ -55,7 +102,8 @@ class MainActivity : ComponentActivity() {
                     ) {
                         Spacer(Modifier.height(24.dp))
                         Text("YASIN VPN PRO", style = MaterialTheme.typography.headlineMedium, color = Gold)
-                        Text(status.value, style = MaterialTheme.typography.headlineSmall, color = if (connected.value) Gold else Color.White)
+                        Text(status.value, style = MaterialTheme.typography.titleLarge, color = if (connected.value) Gold else Color.White)
+                        Text(traffic.value, color = Color.LightGray, style = MaterialTheme.typography.bodyMedium)
                         Text(
                             if (hasConfig.value) "کانفیگ WireGuard ذخیره شده" else "برای شروع، فایل کانفیگ WireGuard را وارد کن",
                             color = Color.LightGray
@@ -82,11 +130,12 @@ class MainActivity : ComponentActivity() {
                         if (busy.value) CircularProgressIndicator(color = Gold)
                         Spacer(Modifier.weight(1f))
                         Text(
-                            "حریم خصوصی: برنامه به مخاطبین، پیامک، عکس‌ها، فایل‌های شخصی یا موقعیت مکانی دسترسی نمی‌خواهد.",
+                            "برنامه به مخاطبین، پیامک، عکس‌ها، فایل‌های شخصی یا موقعیت مکانی دسترسی نمی‌خواهد.",
                             color = Color.LightGray,
                             style = MaterialTheme.typography.bodySmall
                         )
-                        Text("فقط از کانفیگ سروری استفاده کن که به آن اعتماد داری.", color = Color.LightGray, style = MaterialTheme.typography.bodySmall)
+                        Text("علامت VPN به‌تنهایی به معنی دسترسی اینترنت نیست؛ وضعیت پاسخ سرور جداگانه بررسی می‌شود.",
+                            color = Color.LightGray, style = MaterialTheme.typography.bodySmall)
                     }
                 }
             }
@@ -102,7 +151,7 @@ class MainActivity : ComponentActivity() {
                 contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 preferences.edit().putString("config_uri", uri.toString()).apply()
             } catch (_: SecurityException) {
-                // Keep the parsed config in memory even if the provider does not support persistent grants.
+                // Keep the parsed config in memory if persistent permission is unavailable.
             }
             config = parsed
             hasConfig.value = true
@@ -178,6 +227,7 @@ class MainActivity : ComponentActivity() {
     private fun disconnect() {
         busy.value = true
         status.value = "در حال قطع اتصال..."
+        mainHandler.removeCallbacks(statsMonitor)
         worker.execute {
             try {
                 backend.setState(tunnel, Tunnel.State.DOWN, null)
@@ -185,6 +235,7 @@ class MainActivity : ComponentActivity() {
                     connected.value = false
                     busy.value = false
                     status.value = "اتصال قطع شد"
+                    traffic.value = "تونل قطع است"
                 }
             } catch (e: Exception) {
                 runOnUiThread {
@@ -196,11 +247,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun formatBytes(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format(java.util.Locale.US, "%.1f KB", kb)
+        return String.format(java.util.Locale.US, "%.1f MB", kb / 1024.0)
+    }
+
     private fun toast(message: String) {
         android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_LONG).show()
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(statsMonitor)
         worker.shutdown()
         super.onDestroy()
     }
