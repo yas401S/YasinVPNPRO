@@ -1,5 +1,6 @@
 package com.yasinvpn.pro
 
+import android.content.Intent
 import android.net.VpnService
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -18,34 +19,74 @@ import com.wireguard.android.backend.Backend
 import com.wireguard.android.backend.GoBackend
 import com.wireguard.android.backend.Tunnel
 import com.wireguard.config.Config
+import java.util.concurrent.Executors
 
 private val Navy = Color(0xFF071426)
 private val Gold = Color(0xFFE0B85C)
 
 class MainActivity : ComponentActivity() {
     private lateinit var backend: Backend
-    private val tunnel = AppTunnel()
-    private var config: Config? = null
+    private val worker = Executors.newSingleThreadExecutor()
     private val connected = mutableStateOf(false)
     private val hasConfig = mutableStateOf(false)
+    private val busy = mutableStateOf(false)
+    private val status = mutableStateOf("آماده اتصال")
+    private var config: Config? = null
+    private val preferences by lazy { getSharedPreferences("yasin_vpn", MODE_PRIVATE) }
+    private val tunnel = AppTunnel { state ->
+        runOnUiThread {
+            connected.value = state == Tunnel.State.UP
+            busy.value = false
+            status.value = if (connected.value) "تونل WireGuard فعال است" else "اتصال برقرار نیست"
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         backend = GoBackend(this)
+        restoreConfig()
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(primary = Gold, background = Navy, surface = Color(0xFF10243D))) {
                 Surface(Modifier.fillMaxSize(), color = Navy) {
-                    Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                    Column(
+                        Modifier.fillMaxSize().padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(18.dp)
+                    ) {
+                        Spacer(Modifier.height(24.dp))
                         Text("YASIN VPN PRO", style = MaterialTheme.typography.headlineMedium, color = Gold)
-                        Text(if (connected.value) "متصل" else "آماده اتصال", style = MaterialTheme.typography.headlineSmall, color = Color.White)
-                        Text(if (hasConfig.value) "فایل WireGuard وارد شده" else "ابتدا فایل کانفیگ WireGuard را اضافه کن", color = Color.LightGray)
-                        Button(onClick = { picker.launch(arrayOf("text/*", "application/octet-stream")) }, modifier = Modifier.fillMaxWidth()) {
-                            Text("افزودن کانفیگ")
+                        Text(status.value, style = MaterialTheme.typography.headlineSmall, color = if (connected.value) Gold else Color.White)
+                        Text(
+                            if (hasConfig.value) "کانفیگ WireGuard ذخیره شده" else "برای شروع، فایل کانفیگ WireGuard را وارد کن",
+                            color = Color.LightGray
+                        )
+                        Button(
+                            onClick = { picker.launch(arrayOf("text/*", "application/octet-stream")) },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !busy.value
+                        ) { Text("افزودن / تغییر کانفیگ") }
+                        Button(
+                            onClick = { if (connected.value) disconnect() else connect() },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(14.dp),
+                            enabled = !busy.value && (connected.value || hasConfig.value)
+                        ) {
+                            Text(
+                                when {
+                                    busy.value -> "لطفاً صبر کن..."
+                                    connected.value -> "قطع اتصال"
+                                    else -> "اتصال امن"
+                                }
+                            )
                         }
-                        Button(onClick = { if (connected.value) disconnect() else connect() }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp)) {
-                            Text(if (connected.value) "قطع اتصال" else "اتصال امن")
-                        }
-                        Text("بدون دسترسی به مخاطبین، پیامک، گالری یا موقعیت مکانی", color = Color.LightGray)
+                        if (busy.value) CircularProgressIndicator(color = Gold)
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            "حریم خصوصی: برنامه به مخاطبین، پیامک، عکس‌ها، فایل‌های شخصی یا موقعیت مکانی دسترسی نمی‌خواهد.",
+                            color = Color.LightGray,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Text("فقط از کانفیگ سروری استفاده کن که به آن اعتماد داری.", color = Color.LightGray, style = MaterialTheme.typography.bodySmall)
                     }
                 }
             }
@@ -53,50 +94,121 @@ class MainActivity : ComponentActivity() {
     }
 
     private val picker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) try {
-            contentResolver.openInputStream(uri)?.use { config = Config.parse(it); hasConfig.value = true }
+        if (uri == null) return@registerForActivityResult
+        try {
+            val parsed = contentResolver.openInputStream(uri)?.use { Config.parse(it) }
+                ?: throw IllegalArgumentException("خواندن فایل ممکن نشد")
+            try {
+                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                preferences.edit().putString("config_uri", uri.toString()).apply()
+            } catch (_: SecurityException) {
+                // Keep the parsed config in memory even if the provider does not support persistent grants.
+            }
+            config = parsed
+            hasConfig.value = true
+            status.value = "کانفیگ آماده استفاده است"
+            toast("کانفیگ با موفقیت وارد شد")
         } catch (e: Exception) {
-            android.widget.Toast.makeText(this, "کانفیگ معتبر نیست: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+            config = null
+            hasConfig.value = false
+            preferences.edit().remove("config_uri").apply()
+            toast("فایل کانفیگ معتبر نیست یا قابل خواندن نیست")
+        }
+    }
+
+    private fun restoreConfig() {
+        val saved = preferences.getString("config_uri", null) ?: return
+        try {
+            val uri = android.net.Uri.parse(saved)
+            config = contentResolver.openInputStream(uri)?.use { Config.parse(it) }
+            hasConfig.value = config != null
+            if (hasConfig.value) status.value = "کانفیگ ذخیره‌شده بازیابی شد"
+        } catch (_: Exception) {
+            config = null
+            hasConfig.value = false
+            preferences.edit().remove("config_uri").apply()
+            status.value = "لطفاً کانفیگ را دوباره وارد کن"
         }
     }
 
     private fun connect() {
         val cfg = config ?: run {
-            android.widget.Toast.makeText(this, "ابتدا کانفیگ WireGuard را اضافه کن", android.widget.Toast.LENGTH_LONG).show()
+            toast("ابتدا فایل کانفیگ WireGuard را اضافه کن")
             return
         }
+        busy.value = true
+        status.value = "در حال آماده‌سازی اتصال..."
         val permission = VpnService.prepare(this)
         if (permission != null) permissionLauncher.launch(permission) else connectWith(cfg)
     }
 
-    private val permissionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-        if (it.resultCode == RESULT_OK) config?.let { cfg -> connectWith(cfg) }
+    private val permissionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == RESULT_OK) {
+            config?.let { connectWith(it) } ?: run {
+                busy.value = false
+                status.value = "کانفیگ در دسترس نیست"
+            }
+        } else {
+            busy.value = false
+            status.value = "مجوز VPN داده نشد"
+        }
     }
 
     private fun connectWith(cfg: Config) {
-        Thread {
+        worker.execute {
             try {
                 backend.setState(tunnel, Tunnel.State.UP, cfg)
-                runOnUiThread { connected.value = true }
+                runOnUiThread {
+                    if (!connected.value) {
+                        busy.value = false
+                        status.value = "درخواست اتصال ارسال شد؛ در انتظار وضعیت تونل..."
+                    }
+                }
             } catch (e: Exception) {
-                runOnUiThread { android.widget.Toast.makeText(this, "اتصال ناموفق: ${e.message}", android.widget.Toast.LENGTH_LONG).show() }
+                runOnUiThread {
+                    busy.value = false
+                    connected.value = false
+                    status.value = "اتصال ناموفق بود"
+                    toast("اتصال برقرار نشد: ${e.localizedMessage ?: "خطای نامشخص"}")
+                }
             }
-        }.start()
+        }
     }
 
     private fun disconnect() {
-        Thread {
+        busy.value = true
+        status.value = "در حال قطع اتصال..."
+        worker.execute {
             try {
                 backend.setState(tunnel, Tunnel.State.DOWN, null)
-                runOnUiThread { connected.value = false }
+                runOnUiThread {
+                    connected.value = false
+                    busy.value = false
+                    status.value = "اتصال قطع شد"
+                }
             } catch (e: Exception) {
-                runOnUiThread { android.widget.Toast.makeText(this, "قطع اتصال ناموفق: ${e.message}", android.widget.Toast.LENGTH_LONG).show() }
+                runOnUiThread {
+                    busy.value = false
+                    status.value = "قطع اتصال ناموفق بود"
+                    toast("قطع اتصال ناموفق بود: ${e.localizedMessage ?: "خطای نامشخص"}")
+                }
             }
-        }.start()
+        }
+    }
+
+    private fun toast(message: String) {
+        android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_LONG).show()
+    }
+
+    override fun onDestroy() {
+        worker.shutdown()
+        super.onDestroy()
     }
 }
 
-private class AppTunnel : Tunnel {
+private class AppTunnel(
+    private val stateListener: (Tunnel.State) -> Unit
+) : Tunnel {
     override fun getName() = "YasinVPNPRO"
-    override fun onStateChange(newState: Tunnel.State) {}
+    override fun onStateChange(newState: Tunnel.State) = stateListener(newState)
 }
