@@ -38,7 +38,7 @@ class MainActivity : ComponentActivity() {
     private var config: Config? = null
     private val preferences by lazy { getSharedPreferences("yasin_vpn", MODE_PRIVATE) }
 
-    private val statsMonitor = object : Runnable {
+    private val statsMonitor: Runnable = object : Runnable {
         override fun run() {
             if (!connected.value || isFinishing || isDestroyed) return
             worker.execute {
@@ -71,7 +71,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private val tunnel = AppTunnel { state ->
+    private val tunnel: Tunnel = AppTunnel { state ->
         runOnUiThread {
             connected.value = state == Tunnel.State.UP
             busy.value = false
